@@ -1,8 +1,8 @@
 from __future__ import annotations
-from typing import Any, List, Optional, Set, Union, Tuple, Dict, Callable, cast, TYPE_CHECKING, Type, DefaultDict, Literal
+from typing import Any, List, Optional, Set, Union, Tuple, Dict, Callable, cast, TYPE_CHECKING, Type, DefaultDict, Sequence, Generator, FrozenSet, Literal
 import sys, time, functools, itertools, math, operator, hashlib, os, types, pickle, pathlib, inspect, weakref
 from enum import auto, IntEnum, Enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections import defaultdict
 from tinygrad.dtype import ConstType, ImageDType, PtrDType, dtypes, DType, truncate
 from tinygrad.helpers import ContextVar, prod, getenv, all_same, Context, partition, temp, unwrap, T
@@ -166,6 +166,9 @@ class Ops(FastEnum):
   CONST = auto()
 
 class GroupOp:
+  All = set(map(Ops, range(min(Ops), max(Ops)+1)))
+  Const = {Ops.CONST, Ops.VCONST}
+  NonConst = All - Const
   Unary = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIP, Ops.NEG}
   Binary = {Ops.ADD, Ops.MUL, Ops.IDIV, Ops.MAX, Ops.MOD, Ops.CMPLT, Ops.CMPNE, Ops.XOR, Ops.SHL, Ops.SHR, Ops.OR, Ops.AND, Ops.THREEFRY,
             Ops.SUB, Ops.FDIV}
@@ -230,6 +233,15 @@ class UOpMetaClass(type):
     UOpMetaClass.ucache[key] = weakref.ref(created:=super().__call__(*key))
     return created
 
+class Move(FastEnum):
+  DOWN = auto()
+  UP = auto()
+def flip(moves: List[Move]): return [Move.UP if m is Move.DOWN else Move.DOWN for m in moves]
+def suffixes(l0: List[T], l1: List[T]) -> Tuple[List[T], List[T]]:
+  for i in range(len(l0)):
+    if l0[i] != l1[i]: return l0[i:], l1[i:]
+  return [], l1[len(l0):]
+UOpTraversal = Generator['UOp', Move, None]
 # NOTE: this should be frozen, but frozen is slower
 @dataclass(eq=False, slots=True)
 class UOp(MathTrait, metaclass=UOpMetaClass):
@@ -260,7 +272,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
 
   @functools.cached_property
   def tuplize(self:UOp) -> Tuple[int, Any, Optional[DType], Tuple]:
-    return (self.op.value, self.arg, self.dtype, tuple(x.tuplize for x in self.src))
+    return (self.op, self.arg, self.dtype, tuple(x.tuplize for x in self.src))
 
   # *** uop shape stuff ***
 
@@ -570,33 +582,25 @@ def lines(fn) -> List[str]:
   with open(fn) as f: return f.readlines()
 
 class UPat(MathTrait):
-  __slots__ = ("op", "dtype", "arg", "name", "src")
+  __slots__ = ["op", "dtype", "vec", "arg", "name", "src"]
   def __init__(self, op:Optional[Union[Ops, Tuple[Ops, ...], Set[Ops]]]=None, dtype:Optional[Union[DType, Tuple[DType, ...]]]=None,
                src:Optional[Union[Tuple[UPat, ...], List[UPat], UPat]]=None, arg:Any=None,
-               name:Optional[str]=None, allow_any_len:bool=False, location=None, custom_early_reject:Optional[Set[Ops]]=None):
+               name:Optional[str]=None, allow_any_len:bool=False, location=None):
     assert op is None or isinstance(op, Ops) or isinstance(op, tuple) or isinstance(op, set), "op must be Ops or tuple of Ops"
     self.op: Optional[Tuple[Ops, ...]] = (op,) if isinstance(op, Ops) else (tuple(op) if isinstance(op, set) else op)
     self.dtype: Optional[Tuple[DType, ...]] = (dtype,) if isinstance(dtype, DType) else dtype
-    self.arg, self.name, self._in_src, self.custom_early_reject = arg, name, src, custom_early_reject
-    self.src: Any = None
+    assert self.dtype is None or len(set(d.vcount for d in self.dtype)) == 1, "dtypes must have same shape"
+    self.vec = None if self.dtype is None or self.dtype[0].vcount == 1 else True
+    self.arg, self.name, self.src = arg, name, src
     assert self.name != "ctx", "UPat can't be named ctx"
-
-    # try all permutations if it's a list
-    if isinstance(src, list): self.src = list(itertools.permutations(src)) if not all_same(src) else [src]
-    # only one if it's a tuple
-    elif isinstance(src, tuple): self.src = [src]
-    # repeat if it's a UPat
-    elif isinstance(src, UPat): self.src = [itertools.repeat(src)]
-
-    self.allowed_len: int = -1 if allow_any_len or isinstance(src, UPat) or src is None else len(src)
     self.location = location or get_location()
+    self.len: Optional[int] = None if allow_any_len or isinstance(src, UPat) or src is None else len(src)
 
-    if custom_early_reject is not None: self.early_reject = custom_early_reject
-    else:
-      upat_match = [src] if isinstance(src, UPat) else ([] if src is None else self.src[0])
-      self.early_reject = {pp.op[0] for pp in upat_match if pp.op is not None and len(pp.op) == 1}
-
-  def named(self, name:str): return UPat(self.op, self.dtype, self._in_src, self.arg, name, self.allowed_len == -1, self.custom_early_reject)
+  def named(self, name:str): return UPat(self.op, self.dtype, self.src, self.arg, name, self.len is None)
+  def variants(self):
+    if isinstance(self.src, list):
+      return [UPat(self.op, self.dtype, perm, self.arg, self.name, self.len is None) for perm in itertools.permutations(self.src)]
+    return [self]
 
   @staticmethod
   def any(*src): return UPatAny(src=src)
@@ -626,7 +630,7 @@ class UPat(MathTrait):
     asrc = (self,)+src
     return UPat(op, dtypes.bool if op in {Ops.CMPLT, Ops.CMPNE} else asrc[-1].dtype, list(asrc) if op in GroupOp.Commutative else asrc)
 
-  def printable(self:UPat) -> str:
+  def printable(self) -> str:
     try: return lines(self.location[0])[self.location[1]-1].strip()
     except FileNotFoundError: return "<missing>"
 
@@ -634,31 +638,11 @@ class UPat(MathTrait):
     def rep(x):
       form = "UPat(%s, %s, name=%s, dtype=%s, allow_any_len=%s, src=%s)"
       return form % (None if x.op is None else ('(%s)'%', '.join(map(str, x.op))), x.arg, repr(x.name),
-        set(x.dtype) if x.dtype else None, x.allowed_len == 0, "[%s]" if x.src and len(x.src)>1 else "(%s)")
-    return pretty_print(self, rep, srcfn=lambda x:None if x.src is None else [next(x.src[0])] if isinstance(x.src[0], itertools.repeat) else x.src[0])
+        set(x.dtype) if x.dtype else None, x.len == 0,
+        "%s" if isinstance(x.src, UPat) else "[%s]" if x.src and len(x.src)>1 else "(%s)")
+    return pretty_print(self, rep, srcfn=lambda x:None if x.src is None else [x.src] if isinstance(x.src, UPat) else x.src)
 
-  def match(self:UPat, uop:UOp, store:Dict[str, UOp]) -> List[Dict[str, UOp]]:
-    if (self.op is not None and uop.op not in self.op) or \
-       (self.name is not None and store.setdefault(self.name, uop) is not uop) or \
-       (self.dtype is not None and uop.dtype not in self.dtype and uop.dtype.scalar() not in self.dtype) or \
-       (self.arg is not None and self.arg != uop.arg) or \
-       (self.allowed_len != -1 and len(uop.src) != self.allowed_len): return []
-    if self.src is None: return [store]
-    res: List[Dict[str, UOp]] = []
-    for vp in self.src:
-      stores, new_stores = [store.copy()], []
-      for uu, vv in zip(uop.src, vp):
-        for s in stores: new_stores.extend(vv.match(uu, s))
-        stores, new_stores = new_stores, []
-      res.extend(stores)
-    return res
-
-class UPatAny(UPat):
-  def match(self:UPat, uop:UOp, store:Dict[str, UOp]) -> List[Dict[str, UOp]]:
-    ret = []
-    for x in self.src[0]:
-      if (match:=x.match(uop, store.copy())): ret.extend(match)
-    return ret
+class UPatAny(UPat): pass
 
 def deconstruct_function(fxn:Callable) -> Tuple:
   new_globals = {k:v for k,v in fxn.__globals__.items() if k in fxn.__code__.co_names}
@@ -669,35 +653,212 @@ def deconstruct_function(fxn:Callable) -> Tuple:
   ret = fxn.__code__, new_globals, fxn.__name__, fxn.__defaults__
   return pickle.loads(pickle.dumps(ret)) if getenv("TEST_PICKLE") else ret
 
-class PatternMatcher:
-  def __init__(self, patterns:List[Tuple[UPat, Callable]]):
-    self.patterns = patterns
-    # NOTE: use of DefaultDict here is very dangerous! all keys will live for the lifetime of the PatternMatcher!
-    self.pdict: Dict[Ops, List[Tuple[UPat, Callable, Set, bool]]] = {}
-    # uop is required, arg is optional
-    for p,fxn in self.patterns:
-      assert p.op is not None
-      tuple_fxn = fxn if isinstance(fxn, tuple) else deconstruct_function(fxn)
-      real_fxn = types.FunctionType(*tuple_fxn)
-      for uop in p.op: self.pdict.setdefault(uop, []).append((p, real_fxn, p.early_reject, 'ctx' in inspect.signature(real_fxn).parameters))
+class PatTraversal:
+  __slots__ = ['pat', 'i', 'stack', 'moves']
+  def __init__(self, pat: UPat, i: int, stack: List[Tuple[UPat, int]], moves: List[Move]):
+    self.pat, self.i, self.stack, self.moves = pat, i, stack, moves
+  @staticmethod
+  def from_upat(pat: UPat): return PatTraversal(pat, -1, [], [])
+  def next(self) -> List[Tuple[List[Move], UPat, PatTraversal]]:
+    if self.i == -1:
+      if isinstance(self.pat, UPatAny):
+        assert isinstance(self.pat.src, tuple)
+        return sum([PatTraversal(src, -1, self.stack, self.moves).next() for src in self.pat.src], [])
+      return [(self.moves, self.pat, PatTraversal(self.pat, 0, self.stack, []))]
+    if isinstance(self.pat.src, UPat) and self.i == 0:
+      return PatTraversal(self.pat.src, -1, self.stack + [(self.pat, self.i+1)], self.moves + [Move.DOWN]).next()
+    if self.pat.src is None or isinstance(self.pat.src, UPat) or self.i >= len(self.pat.src):
+      if len(self.stack) == 0: return []
+      return PatTraversal(self.stack[-1][0], self.stack[-1][1], self.stack[:-1], self.moves + [Move.UP]).next()
+    if isinstance(self.pat.src, list):
+      return sum([PatTraversal(var, self.i, self.stack, self.moves).next() for var in self.pat.variants()], [])
+    return PatTraversal(self.pat.src[self.i], -1, self.stack + [(self.pat, self.i+1)], self.moves + [Move.DOWN]).next()
 
-  def __reduce__(self): return PatternMatcher, ([(x,deconstruct_function(fxn) if fxn.__name__ == "<lambda>" else fxn) for x,fxn in self.patterns],)
+# properties to check in the automaton, in order
+PROPS: Dict[str, Callable[[UOp], Any]] = {
+  'op': operator.attrgetter('op'),
+  'name': lambda uop: None,
+  'arg': operator.attrgetter('arg'),
+  'dtype': lambda uop: uop.dtype.scalar(),
+  'vec': lambda uop: uop.dtype.vcount > 1,
+  'len': lambda uop: len(uop.src),
+}
+START, NAME, PROPKEYS, PROPLIST, TUPKEYS = 0, 1, list(PROPS.keys()), list(PROPS.values()), {"op", "dtype"}
+class VarAllocator:
+  def __init__(self): self.next = 0
+  def alloc(self):
+    self.next = (res := self.next) + 1
+    return res
+Binds = List[Tuple[str, int]]
+class Rewriter:
+  __slots__ = ["cb", "has_ctx", "binds"]
+  def __init__(self, cb: Callable[..., Any], has_ctx:Optional[bool]=None, binds:Optional[Binds]=None):
+    has_ctx = ('ctx' in inspect.signature(cb).parameters) if has_ctx is None else has_ctx
+    self.cb, self.has_ctx, self.binds = cb, has_ctx, binds or []
+  def __repr__(self): return f"Rewriter({','.join(map(str, self.binds))})"
+  def __getstate__(self): return (deconstruct_function(self.cb) if isinstance(self.cb, types.FunctionType) else self.cb, self.has_ctx, self.binds)
+  def __setstate__(self, state):
+    self.cb, self.has_ctx, self.binds = types.FunctionType(*state[0]) if isinstance(state[0], tuple) else state[0], state[1], state[2]
+  def bind(self, name, var): return Rewriter(self.cb, self.has_ctx, self.binds + [(name, var)])
+  def clear_binds(self): return Rewriter(self.cb, self.has_ctx, [])
+  def __call__(self, store: Dict[str, UOp], ctx=None): return self.cb(ctx=ctx, **store) if self.has_ctx else self.cb(**store)
+  def check_and_call(self, vals: Dict[int, UOp], store: Dict[str, UOp], ctx=None):
+    for name, var in self.binds:
+      if store.setdefault(name, val := vals[var]) is not val: return None
+    return self(store, ctx=ctx)
+
+PatTuple = Tuple[UPat, PatTraversal, Rewriter]
+PendingTuple = Tuple[List[Move], PatTuple]
+TravTuple = Tuple[PatTraversal, Rewriter]
+
+def edge_partition(prop: int, pats: List[PatTuple]) -> Tuple[Dict[FrozenSet[int], List[Any]], Set[int]]:
+  idxpart: Dict[Any, Set[int]] = {}
+  for i, (pat, _t, _r) in enumerate(pats):
+    attr = getattr(pat, PROPKEYS[prop])
+    if attr is not None and PROPKEYS[prop] in TUPKEYS:
+      assert isinstance(attr, tuple)
+      for v in attr: idxpart.setdefault(v, set()).add(i)
+    else: idxpart.setdefault(attr, set()).add(i)
+  edgepart: Dict[FrozenSet[int], List[int]] = {}
+  for v, idxs in idxpart.items(): edgepart.setdefault(frozenset(idxs), []).append(v)
+  return edgepart, idxpart.get(None, set())
+
+def va_cb(__matcher, __name, __pop, __r, ctx=None, **store):
+  for src in (store.pop(__name) if __pop else store[__name]).src[1:]:
+    if (store := __matcher.rewrite(src, store, ctx=ctx)) is None: return
+  return __r(store, ctx=ctx)
+
+def handle_vararg(pat: UPat, trav: PatTraversal, r: Rewriter, va: VarAllocator) -> PatTuple:
+  assert isinstance(pat.src, UPat)
+  matcher, name, pop = RewriteAutomaton.matcher(pat.src), pat.name or f"__vararg{va.alloc()}", pat.name is None
+  return pat.named(name), trav, Rewriter(functools.partial(va_cb, matcher, name, pop, r), True, r.binds.copy())
+
+DETERMINISTIC_DEPTH = 7
+@dataclass(slots=True)
+class Edge:
+  state: 'State'
+  moves: List[Move]
+  @staticmethod
+  def from_pats(prop: int, pats: List[PatTuple], pending: List[PendingTuple], va: VarAllocator, depth: int) -> Edge:
+    deterministic, v = depth < DETERMINISTIC_DEPTH, None
+    if prop == NAME:
+      for i, (pat, trav, r) in enumerate(pats):
+        if isinstance(pat.src, UPat): pats[i] = (pat, trav, r) = handle_vararg(pat, trav, r, va)
+        if pat.name is not None: pats[i] = (pat, trav, r.bind(pat.name, v := (v if v is not None else va.alloc())))
+      if v is None: return Edge.from_pats(prop+1, pats, pending, va, depth)
+      return Edge(State(prop, {None: Edge.from_pats(prop+1, pats, pending, va, depth+1)}, v), [])
+    if prop != len(PROPKEYS):
+      (edgepart, default), edges = edge_partition(prop, pats), {}
+      if len(edgepart) == 1 and next(iter(edgepart.values())) == [None]: return Edge.from_pats(prop+1, pats, pending, va, depth)
+      for subpats, vs in edgepart.items():
+        edge = Edge.from_pats(prop+1, [pats[i] for i in (subpats|default if deterministic else subpats)], pending, va, depth+1)
+        for v in vs: edges[v] = edge
+      if pending and None not in edges: edges[None] = Edge.from_traversals([], pending, va, depth+1)
+      return Edge(State(prop, edges, deterministic=deterministic), [])
+    return Edge.from_traversals([(trav, r) for _,trav,r in pats], pending, va, depth)
+  @staticmethod
+  def from_traversals(travs: List[TravTuple], pending: List[PendingTuple], va: VarAllocator, depth:int=0) -> Edge:
+    accepts = []
+    for trav, r in travs:
+      if len(n := trav.next()) == 0: accepts.append(r)
+      else: pending = pending + [(m, (p, t, r)) for (m, p, t) in n]
+    if len(pending) == 0: return Edge(State(START, accepts=accepts), [])
+    moves, pats, pending = (ordered := sorted(pending, key=lambda v: v[0]))[0][0], [], []
+    for (m, pat) in ordered:
+      m0, m1 = suffixes(moves, m)
+      if len(m1) == 0: pats.append(pat)
+      else: pending.append((flip(m0)+m1, pat))
+    edge = Edge.from_pats(START, pats, pending, va, depth)
+    return Edge(replace(edge.state, accepts=accepts+edge.state.accepts), moves+edge.moves)
+
+@dataclass(slots=True)
+class State:
+  prop: int # which property to check
+  edges: Dict[Any, Edge] = field(default_factory=dict) # map of value -> edge to take
+  var: Optional[int] = None # variable id to bind to the current UOp
+  accepts: List[Rewriter] = field(default_factory=list) # list of rewriters to run if this node is reached
+  deterministic: bool = False # whether multiple edges may be taken by a single value (with backtracking on failure)
+  # deterministic => edges[None] means "else"; nondeterministic => edges[None] means "any"
+  def execute(self, uop: UOp, vals: Dict[int, UOp], store: Dict[str, UOp], ctx=None, stack=None, edge=None):
+    state, stack, i, v = self, stack or [], 0, None
+    while True:
+      # possibly traverse edge
+      if edge is not None:
+        for move in edge.moves:
+          if move is Move.DOWN:
+            if i >= len(uop.src): return None
+            stack.append((uop, i+1))
+            uop, i = uop.src[i], 0
+          else: uop, i = stack.pop()
+        state = edge.state
+      if state.accepts:
+        for acc in state.accepts:
+          if (res := acc.check_and_call(vals, store.copy(), ctx=ctx)) is not None: return res
+      if state.prop is NAME:
+        if state.var is not None and vals.setdefault(state.var, uop) is not uop: return None
+      else: v = PROPLIST[state.prop](uop)
+      if not state.deterministic:
+        edge, fallback = state.edges.get(v, None), None if v is None else state.edges.get(None, None)
+        if edge is None and fallback is None: return None
+        if fallback is None: pass
+        elif edge is None: edge = fallback
+        elif (res := state.execute(uop, vals.copy(), store, ctx=ctx, stack=stack.copy(), edge=edge)) is not None: return res
+        else: edge = fallback
+      elif (edge := state.edges.get(v, None)) is not None: pass
+      elif v is not None and (edge := state.edges.get(None, None)) is not None: pass
+      else: return None
+  def rewrite(self, uop: UOp, store: Dict[str, UOp], ctx=None): return self.execute(uop, {}, store, ctx=ctx)
+  def graphviz(self, dot=None, visited=None, parent=None, edge_label=""):
+    from graphviz import Digraph
+    if dot is None: dot = Digraph()
+    if visited is None: visited = set()
+    state_label = f"{PROPKEYS[self.prop]}" + (f": {self.var}" if self.var is not None else "") + ("\ndet" if self.deterministic else "\nnondet")
+    if self.accepts: state_label += "\n" + "\n".join(str(a) for a in self.accepts)
+    dot.node(str(id(self)), label=state_label)
+    if parent is not None: dot.edge(str(parent), str(id(self)), label=edge_label)
+    if id(self) in visited: return dot
+    visited.add(id(self))
+    for val, edge in self.edges.items():
+      label = f"{val},  [{', '.join(str(m)[5:] for m in edge.moves)}]"
+      edge.state.graphviz(dot=dot, visited=visited, parent=id(self), edge_label=label)
+    return dot
+
+# creation can recurse a lot
+sys.setrecursionlimit(10000)
+
+class RewriteAutomaton:
+  def __init__(self, rules: Sequence[Tuple[UPat, Rewriter]]):
+    travs: List[TravTuple] = [(PatTraversal.from_upat(p), r) for i,(p,r) in enumerate(rules)]
+    self.va = VarAllocator()
+    self.root = Edge.from_traversals(travs, [], self.va).state
+  @functools.lru_cache(None)
+  @staticmethod
+  def matcher(pat: UPat) -> RewriteAutomaton: return RewriteAutomaton([(pat, Rewriter(lambda **store: store))])
+  def rewrite(self, uop: UOp, store: Dict[str, UOp], ctx=None): return self.root.rewrite(uop, store, ctx=ctx)
+  def render(self, filename="automaton"): self.root.graphviz().render(filename, format="png", cleanup=True)
+
+class PatternMatcher:
+  def __init__(self, patterns: Sequence[Tuple[UPat, Rewriter|Callable]]):
+    self.patterns = [(pat, Rewriter(fxn) if not isinstance(fxn, Rewriter) else fxn) for pat, fxn in patterns]
 
   @functools.lru_cache(None)  # pylint: disable=method-cache-max-size-none
   def __add__(self, more:PatternMatcher): return PatternMatcher(self.patterns+more.patterns)
 
-  def rewrite(self, uop:UOp, ctx=None) -> Optional[UOp]:
-    ler = {u.op for u in uop.src}
-    for p,fxn,early_reject,has_ctx in self.pdict.get(uop.op, []):
-      if not early_reject.issubset(ler): continue
-      for match in p.match(uop, {}):
-        if (ret:=(fxn(ctx=ctx, **match) if has_ctx else fxn(**match))) is not None: return ret
-    return None
+  @functools.cached_property
+  def automaton(self):
+    path = f"/tmp/automaton_{hashlib.sha256(pickle.dumps(self.patterns)).hexdigest()}"
+    if os.path.exists(path):
+      with open(path, "rb") as f: res = pickle.loads(f.read())
+    else:
+      with open(path, "wb") as f: f.write(pickle.dumps(res := RewriteAutomaton(self.patterns)))
+    return res
+  def rewrite(self, uop:UOp, ctx=None) -> Optional[UOp]: return self.automaton.rewrite(uop, {}, ctx=ctx)
+  def render(self): self.automaton.render()
 
 # *** tracking pattern matcher ***
 
 TRACK_MATCH_STATS = ContextVar("TRACK_MATCH_STATS", 2 if getenv("VIZ") else 0)
-match_stats:Dict[UPat, List[Union[int, float]]] = dict()
+match_stats:Dict[TrackedPatternMatcher, List[Union[int, float]]] = dict()
 @dataclass(frozen=True)
 class TrackedRewriteContext:
   loc: Tuple[str, int]                                                                              # location that called graph_rewrite
@@ -722,26 +883,34 @@ def track_rewrites(named=False):
   return _decorator
 
 class TrackedPatternMatcher(PatternMatcher):
+  def __init__(self, patterns:List[Tuple[UPat, Callable]]):
+    super().__init__([(p, functools.partial(self.track_rewrite, Rewriter(fxn) if not isinstance(fxn, Rewriter) else fxn, p)) for p, fxn in patterns])
+    frm = sys._getframe(1)
+    # find the real frame in the file that has the UPat, TODO: is there a better way to do this?
+    while frm.f_back is not None and frm.f_code.co_name in {"__add__"}:
+      frm = frm.f_back
+    self.location, match_stats[self] = (frm.f_code.co_filename, frm.f_lineno), [0,0,0.0,0.0]
+
+  def track_rewrite(self, r: Rewriter, p: UPat, /, ctx=None, **store):
+    if isinstance(ret := r(store, ctx=ctx), UOp) and hasattr(self, 'cur_uop') and TRACK_MATCH_STATS >= 2 and len(rewrite_stack) != 0:
+      rewrite_stack[-1][1][-1].matches.append((self.cur_uop, ret, p, time.perf_counter() - self.st))
+    return ret
+
+  def printable(self) -> str:
+    try: return lines(self.location[0])[self.location[1]-1].strip()
+    except FileNotFoundError: return "<missing>"
+
   def rewrite(self, uop:UOp, ctx=None) -> Optional[UOp]:
-    ret = None
-    ler = {u.op for u in uop.src}
-    for p,fxn,early_reject,has_ctx in self.pdict.get(uop.op, []):
-      if p not in match_stats: match_stats[p] = [0,0,0.0,0.0]
-      st = time.perf_counter()
-      if not early_reject.issubset(ler):
-        match_stats[p][2] += time.perf_counter()-st
-        continue
-      match_stats[p][1] += 1
-      for match in p.match(uop, {}):
-        if (ret:=(fxn(ctx=ctx, **match) if has_ctx else fxn(**match))) is not None:
-          match_stats[p][0] += 1
-          match_stats[p][3] += (et:=time.perf_counter()-st)
-          if TRACK_MATCH_STATS >= 3: print(f"{et*1e6:7.2f} us -- ", p.printable())
-          if TRACK_MATCH_STATS >= 2 and len(rewrite_stack) != 0 and isinstance(ret, UOp): rewrite_stack[-1][1][-1].matches.append((uop, ret, p, et))
-          return ret # NOTE: if it returns None, we keep trying to match
-      match_stats[p][2] += time.perf_counter()-st
+    self.cur_uop = uop
+    self.st = time.perf_counter()
+    match_stats[self][1] += 1
+    if (ret := self.automaton.rewrite(uop, {}, ctx=ctx)) is not None:
+      match_stats[self][0] += 1
+      match_stats[self][3] += time.perf_counter()-self.st
+    match_stats[self][2] += time.perf_counter()-self.st
     if TRACK_MATCH_STATS >= 2 and len(rewrite_stack) != 0: rewrite_stack[-1][1][-1].matches.append((uop, ret, None, 0))
-    return None
+    delattr(self, 'cur_uop')
+    return ret
 
 if TRACK_MATCH_STATS:
   PatternMatcher = TrackedPatternMatcher  # type: ignore
@@ -838,7 +1007,8 @@ spec = PatternMatcher([
   # and SHL/SHR, the shift distance can be an int
   (UPat((Ops.SHL, Ops.SHR), src=(UPat(name="x"), UPat(name="y")), name="a"), lambda a,x,y: a.dtype == x.dtype and y.dtype in (x.dtype, dtypes.uint)),
   (UPat(Ops.IDIV, name="x"), lambda x: None if dtypes.is_int(x.dtype) else False),
-  (UPat(GroupOp.ALU, name="x"), lambda x: all(x.dtype == y.dtype for y in x.src)),
+  (UPat(GroupOp.ALU-{Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.SHL, Ops.SHL, Ops.SHR}, name="x"),
+   lambda x: all(x.dtype == y.dtype for y in x.src)),
 
   (UPat(Ops.ASSIGN, src=(UPat((Ops.DEFINE_ACC, Ops.DEFINE_GLOBAL)), UPat())), lambda: True),
   (UPat(Ops.ENDRANGE, dtype=dtypes.void, src=(UPat(Ops.RANGE),)), lambda: True),
@@ -1144,8 +1314,8 @@ symbolic = symbolic_simple+PatternMatcher([
   (((UPat.cvar("c0", vec=False)*UPat.var("x"))+UPat.var("x2")).lt(UPat.cvar("c1", vec=False)),
    lambda x,x2,c0,c1: x.lt(c1//c0) if c1.arg % c0.arg == 0 and c0.arg > x2.vmax and x2.vmin >= 0 else None),
   # ** move add/mul consts to end (NOTE: this is still happening before constant folding) **
-  (UPat(Ops.ADD, src=(UPat.var("x"), UPat.cvar("c1"))) + UPat.var("y"), lambda x,c1,y: (x+y)+c1),
-  (UPat(Ops.MUL, src=(UPat.var("x"), UPat.cvar("c1"))) * UPat.var("y"), lambda x,c1,y: (x*y)*c1),
+  (UPat(Ops.ADD, src=(UPat.var("x"), UPat.cvar("c1"))) + UPat(op=GroupOp.NonConst, name="y"), lambda x,c1,y: (x+y)+c1),
+  (UPat(Ops.MUL, src=(UPat.var("x"), UPat.cvar("c1"))) * UPat(op=GroupOp.NonConst, name="y"), lambda x,c1,y: (x*y)*c1),
   # *** rules from symbolic ***
   # unrolled arange div folding
   (UPat(Ops.ADD, name="divs", src=[UPat(), UPat(Ops.IDIV)]), fold_unrolled_divs),
@@ -1184,7 +1354,8 @@ renderer = PatternMatcher([
   (UPat(Ops.MAX, src=UPat(Ops.NOOP), name="x"), lambda x: UOp(Ops.NOOP, arg=f"max({x.src[0].arg}, {x.src[1].arg})")),
   (UPat(Ops.MULACC, src=UPat(Ops.NOOP), name="x"), lambda x: UOp(Ops.NOOP, arg=f"({x.src[0].arg}*{x.src[1].arg}+{x.src[2].arg})")),
   (UPat(Ops.WHERE, src=UPat(Ops.NOOP), name="x"), lambda x: UOp(Ops.NOOP, arg=f"({x.src[1].arg} if {x.src[0].arg} else {x.src[2].arg})")),
-  (UPat(GroupOp.ALU, src=UPat(Ops.NOOP), name="x"), lambda x: UOp(Ops.NOOP, arg=f"({x.src[0].arg}{syms[x.op]}{x.src[1].arg})")),
+  (UPat(GroupOp.ALU-{Ops.NEG, Ops.MAX, Ops.MULACC, Ops.WHERE}, src=UPat(Ops.NOOP), name="x"),
+   lambda x: UOp(Ops.NOOP, arg=f"({x.src[0].arg}{syms[x.op]}{x.src[1].arg})")),
 ])
 
 # *** what was symbolic.py ***

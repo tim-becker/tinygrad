@@ -230,7 +230,7 @@ def reduce_collapse(acc:UOp, ret:UOp, alu:UOp):
   return ret
 
 acc_pat, rng_pat = UPat(Ops.DEFINE_ACC, name="acc"), UPat(Ops.RANGE, name="rng")
-rng_aug = UPat.any(rng_pat, UPat.var("add")+rng_pat, UPat.var("mul")*rng_pat, UPat.var("add")+UPat.var("mul")*rng_pat)
+rng_aug = UPat.any(rng_pat, UPat.var("add")+UPat.any(rng_pat, UPat.var("mul")*rng_pat))
 
 index_load = UPat.var("buf").index(rng_aug).load(name="ld")
 
@@ -286,8 +286,8 @@ sym = symbolic_flat+PatternMatcher([
   # arange loop folding
   (acc_pat.assign(UPat.any(arange_m, arange_m+UPat.var("extra"))+acc_pat), loop_collapse),
   # indexing, with cast or where
-  (acc_pat.assign(UPat.var("idx").eq(UPat(Ops.RANGE, name="rng")).cast()*index_load+acc_pat), index_collapse),
-  (acc_pat.assign(UPat.var("idx").eq(UPat(Ops.RANGE, name="rng")).where(index_load, UPat.const(None, 0.0))+acc_pat), index_collapse),
+  (acc_pat.assign(UPat.var("idx").eq(rng_pat).cast()*index_load+acc_pat), index_collapse),
+  (acc_pat.assign(UPat.var("idx").eq(rng_pat).where(index_load, UPat.const(None, 0.0))+acc_pat), index_collapse),
   # parentless reduce
   (acc_pat.assign(UPat(Ops.ADD, src=[acc_pat, UPat.var("ret")], name="alu")), reduce_collapse),
   (acc_pat.assign(UPat(Ops.MAX, src=[acc_pat, UPat.var("ret")], name="alu")), reduce_collapse),
@@ -411,7 +411,7 @@ expander = PatternMatcher([
    lambda outer, inner: UOp(Ops.EXPAND, outer.dtype, (inner.src[0],), inner.arg+outer.arg)),
   # do expansion
   (UPat((*GroupOp.ALU, Ops.CAST, Ops.BITCAST, Ops.GEP, Ops.WMMA, Ops.LOAD, Ops.STORE, Ops.INDEX, Ops.ASSIGN,
-         Ops.VECTORIZE, Ops.IF), name="root", custom_early_reject=set([Ops.EXPAND])), do_expand),
+         Ops.VECTORIZE, Ops.IF), name="root"), do_expand),
   (UPat(Ops.CONTRACT, name="con"), do_contract),
   # vectorize DEFINE_ACC
   (UPat(Ops.VECTORIZE, src=UPat(Ops.DEFINE_ACC, name="acc"), name="v"), lambda acc,v: acc.replace(dtype=v.dtype)),
@@ -453,7 +453,7 @@ def delete_redundant_gates(buf:UOp, idx:UOp, val:UOp, store_gate:UOp, cast:Optio
 
 load_store_indexing = PatternMatcher([
   # late fixup of unfoldable image loads
-  (UPat(Ops.LOAD, src=(UPat.var("buf"), UPat()), allow_any_len=True, name="load"), fix_unfoldable_image_load),
+  (UPat(Ops.LOAD, src=(UPat.var("buf"),), allow_any_len=True, name="load"), fix_unfoldable_image_load),
   # simplify valid
   (UPat(Ops.AND, name="valid"), simplify_valid),
   # image load valid idx simplification

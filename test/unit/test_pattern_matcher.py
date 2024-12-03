@@ -121,7 +121,7 @@ class TestPatternMatcher(unittest.TestCase):
     self.assertEqual(matcher.rewrite(c2), None)
 
   def test_dtype_set(self):
-    matcher = PatternMatcher([(UPat(Ops.CONST, name="x", dtype={dtypes.float32, dtypes.float64}), lambda x: x)])
+    matcher = PatternMatcher([(UPat(Ops.CONST, name="x", dtype=(dtypes.float32, dtypes.float64)), lambda x: x)])
     c1 = UOp(Ops.CONST, dtypes.float, arg=1.0)
     c2 = UOp(Ops.CONST, dtypes.float64, arg=1.0)
     c3 = UOp(Ops.CONST, dtypes.float16, arg=1.0)

@@ -1,4 +1,4 @@
-import sys, atexit, functools
+import atexit, functools
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import FrozenSet, Set, Tuple, List, Dict, Optional, DefaultDict
@@ -10,9 +10,6 @@ from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.view import View, strides_for_shape
 from tinygrad.engine.lazy import LazyBuffer
 from tinygrad.device import Buffer
-
-# creation can recurse a lot
-sys.setrecursionlimit(10000)
 
 BUF_LIMIT = {"METAL":32}
 
