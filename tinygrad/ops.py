@@ -1,5 +1,6 @@
 from __future__ import annotations
-from typing import Any, List, Optional, Set, Union, Tuple, Dict, Callable, cast, TYPE_CHECKING, Type, DefaultDict, Sequence, Generator, FrozenSet, Literal
+from typing import \
+  Any, List, Optional, Set, Union, Tuple, Dict, Callable, cast, TYPE_CHECKING, Type, DefaultDict, Sequence, Generator, FrozenSet, Literal
 import sys, time, functools, itertools, math, operator, hashlib, os, types, pickle, pathlib, inspect, weakref
 from enum import auto, IntEnum, Enum
 from dataclasses import dataclass, field, replace
@@ -848,9 +849,9 @@ class PatternMatcher:
   def automaton(self):
     path = f"/tmp/automaton_{hashlib.sha256(pickle.dumps(self.patterns)).hexdigest()}"
     if os.path.exists(path):
-      with open(path, "rb") as f: res = pickle.loads(f.read())
+      with open(path, "rb") as f: res = pickle.load(f)
     else:
-      with open(path, "wb") as f: f.write(pickle.dumps(res := RewriteAutomaton(self.patterns)))
+      with open(path, "wb") as f: pickle.dump(res := RewriteAutomaton(self.patterns), f)
     return res
   def rewrite(self, uop:UOp, ctx=None) -> Optional[UOp]: return self.automaton.rewrite(uop, {}, ctx=ctx)
   def render(self): self.automaton.render()
@@ -885,10 +886,7 @@ def track_rewrites(named=False):
 class TrackedPatternMatcher(PatternMatcher):
   def __init__(self, patterns:List[Tuple[UPat, Callable]]):
     super().__init__([(p, functools.partial(self.track_rewrite, Rewriter(fxn) if not isinstance(fxn, Rewriter) else fxn, p)) for p, fxn in patterns])
-    frm = sys._getframe(1)
-    # find the real frame in the file that has the UPat, TODO: is there a better way to do this?
-    while frm.f_back is not None and frm.f_code.co_name in {"__add__"}:
-      frm = frm.f_back
+    if (frm := sys._getframe(1)).f_back is not None and frm.f_code == PatternMatcher.__add__.__wrapped__.__code__: frm = frm.f_back
     self.location, match_stats[self] = (frm.f_code.co_filename, frm.f_lineno), [0,0,0.0,0.0]
 
   def track_rewrite(self, r: Rewriter, p: UPat, /, ctx=None, **store):
